@@ -51,7 +51,7 @@ Python. Built by a 2-year DevOps engineer on a ₹30,000 (~$360) Windows
 laptop.
 
 GitHub: https://github.com/<your-github-handle>/engram
-Install: `pipx install engram-mcp && engram mcp install --target claude-code`
+Install: `pipx install engram-devops && engram mcp install --target claude-code`
 
 Happy to answer questions.
 
@@ -121,7 +121,7 @@ Tree-sitter for code. 64+ tests passing on Linux + Windows.
 
 **5/**
 
-`pipx install engram-mcp && engram mcp install --target claude-code`
+`pipx install engram-devops && engram mcp install --target claude-code`
 
 That's the install. MIT-licensed. Built solo in ~4 weeks.
 
@@ -158,7 +158,7 @@ Feedback / issues / PRs welcome. 🙏
 - The terminal output: STOP / BLOCK / red, 3 dependents, production
 - Then the same command after `--force`: still surfaces the warning, but
   proceeds (audit-logged)
-- Closing: `pipx install engram-mcp && engram mcp install --target claude-code`
+- Closing: `pipx install engram-devops && engram mcp install --target claude-code`
 - Repo URL + "MIT-licensed, ~3,200 LOC, contributions welcome"
 
 ---

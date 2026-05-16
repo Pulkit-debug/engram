@@ -3,7 +3,7 @@ requires = ["setuptools>=68.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "engram-mcp"
+name = "engram-devops"
 version = "0.2.0"
 description = "Local-first DevOps context and blast-radius layer for AI coding agents"
 readme = "README.md"

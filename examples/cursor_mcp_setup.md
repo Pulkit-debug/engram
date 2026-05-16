@@ -3,7 +3,7 @@
 ## One-line install
 
 ```bash
-pipx install engram-mcp
+pipx install engram-devops
 engram init
 engram index --path ~/projects
 engram mcp install --target cursor

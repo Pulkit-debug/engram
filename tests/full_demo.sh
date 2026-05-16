@@ -26,7 +26,7 @@ if [[ -x "$PROJECT_DIR/.venv/bin/engram" ]]; then
 elif command -v engram >/dev/null 2>&1; then
     ENGRAM="$(command -v engram)"
 else
-    echo "ERROR: engram CLI not found. Install with 'pipx install engram-mcp' or set up the project venv." >&2
+    echo "ERROR: engram CLI not found. Install with 'pipx install engram-devops' or set up the project venv." >&2
     exit 1
 fi
 

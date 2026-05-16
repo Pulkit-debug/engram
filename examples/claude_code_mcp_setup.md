@@ -5,7 +5,7 @@ Two ways to install. Pick whichever you prefer.
 ## Option A — One-line (recommended)
 
 ```bash
-pipx install engram-mcp
+pipx install engram-devops
 engram init                                  # create ~/.engram/, write default config
 engram index --path ~/projects               # index your repos (one-time)
 engram mcp install --target claude-code      # adds an MCP server entry to ~/.claude/mcp.json
