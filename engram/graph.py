@@ -213,6 +213,57 @@ def delete_file_and_dependents(conn: sqlite3.Connection, file_path: str) -> None
 
 
 # ---------------------------------------------------------------------------
+# User annotations (the click-ops "tell Engram what only you know" surface).
+# ---------------------------------------------------------------------------
+
+def upsert_user_annotation(
+    conn: sqlite3.Connection,
+    *,
+    target_uid: str,
+    key: str,
+    value: str,
+    set_by: str = "user",
+) -> None:
+    """Idempotently set a user annotation on a resource."""
+    conn.execute(
+        """
+        INSERT INTO annotation_user(target_uid, key, value, set_by, set_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(target_uid, key) DO UPDATE SET
+            value=excluded.value,
+            set_by=excluded.set_by,
+            set_at=excluded.set_at
+        """,
+        (target_uid, key, value, set_by, _now()),
+    )
+
+
+def get_user_annotations(
+    conn: sqlite3.Connection, target_uid: str,
+) -> dict[str, str]:
+    """Return all user annotations for a resource as a flat dict."""
+    rows = conn.execute(
+        "SELECT key, value FROM annotation_user WHERE target_uid = ?",
+        (target_uid,),
+    ).fetchall()
+    return {r["key"]: r["value"] for r in rows}
+
+
+def remove_user_annotation(
+    conn: sqlite3.Connection, target_uid: str, key: str | None = None,
+) -> int:
+    """Delete a single annotation (key) or all annotations on a resource (key=None)."""
+    if key is None:
+        cur = conn.execute("DELETE FROM annotation_user WHERE target_uid = ?", (target_uid,))
+    else:
+        cur = conn.execute(
+            "DELETE FROM annotation_user WHERE target_uid = ? AND key = ?",
+            (target_uid, key),
+        )
+    return cur.rowcount
+
+
+# ---------------------------------------------------------------------------
 # Read queries — the surface MCP tools will call.
 # ---------------------------------------------------------------------------
 

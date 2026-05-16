@@ -1,0 +1,42 @@
+# Scenario replay for the terraform-aws-modules/terraform-aws-eks module.
+# Source: https://github.com/terraform-aws-modules/terraform-aws-eks
+# Shape: Pure Terraform module (HCL-only with submodules and examples)
+
+- name: destroy_cluster_with_dependents
+  operation: "terraform destroy"
+  target: "cluster"
+  expected_tier: "orange"
+  expected_action: "confirm"
+  min_dependents: 1
+  rationale: "'cluster' resolves to multiple security groups + at least one dependent edge → confirm."
+
+- name: destroy_karpenter
+  operation: "terraform destroy"
+  target: "karpenter"
+  expected_tier: "orange"
+  expected_action: "confirm"
+  min_resources: 2
+  rationale: "Karpenter spans tf:module, helm_release, and pod_identity_association — cross-format."
+
+- name: plan_cluster_is_safe
+  operation: "terraform plan"
+  target: "cluster"
+  expected_tier: "green"
+  expected_action: "proceed"
+  rationale: "terraform plan is read-only; safe regardless of target."
+
+- name: destroy_unknown_resource_no_env_hint
+  operation: "terraform destroy"
+  target: "xyz-fake-resource"
+  expected_tier: "orange"
+  expected_action: "confirm"
+  max_resources: 0
+  rationale: "Unknown target with no env hints → confirm (ask the human)."
+
+- name: destroy_unknown_named_prod
+  operation: "terraform destroy"
+  target: "totally-fake-prod-db"
+  expected_tier: "red"
+  expected_action: "block"
+  max_resources: 0
+  rationale: "Unknown target but name contains 'prod' → Engram blocks. Conservative-by-design."

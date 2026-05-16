@@ -204,6 +204,33 @@ CREATE TABLE IF NOT EXISTS annotation (
 CREATE INDEX IF NOT EXISTS idx_annotation_target ON annotation(target_kind, target_id);
 
 -- ---------------------------------------------------------------------------
+-- User annotations on resources. Distinct from the `annotation` table (which
+-- records labels Engram has WRITTEN onto K8s/Terraform source). This table
+-- records labels the USER has TOLD Engram about — typically about click-ops
+-- resources that have no Terraform / Helm to read tags from.
+--
+-- Example:
+--   engram annotate aws:rds:DBInstance:payments-prod \
+--       --env production --owner platform-team --runbook https://...
+--
+-- These annotations flow into blast_radius() reasons and infra_context()
+-- responses on equal footing with tags pulled from source IaC.
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS annotation_user (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    target_uid     TEXT NOT NULL,                -- resource.uid the annotation describes
+    key            TEXT NOT NULL,                -- 'environment', 'owner', 'runbook', 'note', etc.
+    value          TEXT NOT NULL,
+    set_by         TEXT NOT NULL DEFAULT 'user',
+    set_at         TEXT NOT NULL,
+    UNIQUE (target_uid, key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_annotation_user_target ON annotation_user(target_uid);
+CREATE INDEX IF NOT EXISTS idx_annotation_user_key    ON annotation_user(key);
+
+-- ---------------------------------------------------------------------------
 -- Vector tables (sqlite-vec). Created lazily by db.py because they require
 -- the extension to be loaded; this file documents the intended shape.
 --

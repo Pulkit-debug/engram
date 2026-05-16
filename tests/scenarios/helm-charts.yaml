@@ -1,0 +1,33 @@
+# Scenario replay for prometheus-community/helm-charts.
+# Source: https://github.com/prometheus-community/helm-charts
+# Shape: 40+ Helm charts in one monorepo — tests project detection at scale.
+
+- name: uninstall_prometheus_chart
+  operation: "helm uninstall"
+  target: "prometheus"
+  expected_tier: "orange"
+  expected_action: "confirm"
+  min_resources: 1
+  rationale: "Prometheus chart resolves to a helm:chart row."
+
+- name: uninstall_unknown_chart
+  operation: "helm uninstall"
+  target: "grafana"
+  expected_tier: "orange"
+  expected_action: "confirm"
+  max_resources: 0
+  rationale: "Grafana isn't in prometheus-community; resolves to zero → confirm."
+
+- name: helm_list_safe
+  operation: "helm list"
+  target: "prometheus"
+  expected_tier: "green"
+  expected_action: "proceed"
+  rationale: "helm list is read-only."
+
+- name: helm_template_safe
+  operation: "helm template"
+  target: "prometheus"
+  expected_tier: "green"
+  expected_action: "proceed"
+  rationale: "helm template is read-only (no apply)."

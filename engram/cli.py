@@ -278,6 +278,190 @@ def serve() -> None:
 
 
 @cli.command()
+@click.argument("target", required=True)
+@click.option("--env", "environment", default=None,
+              help="Set environment (production / staging / dev / ...).")
+@click.option("--owner", default=None, help="Owning team / person.")
+@click.option("--runbook", default=None, help="URL of the on-call runbook.")
+@click.option("--note", default=None, help="Free-text note shown in assess output.")
+@click.option("--key", "extra_key", default=None, help="Custom annotation key.")
+@click.option("--value", "extra_value", default=None,
+              help="Custom annotation value (paired with --key).")
+@click.option("--remove", is_flag=True, default=False,
+              help="Remove all user annotations for this target instead of setting.")
+def annotate(target: str, environment: str | None, owner: str | None,
+             runbook: str | None, note: str | None,
+             extra_key: str | None, extra_value: str | None,
+             remove: bool) -> None:
+    """Bolt your knowledge onto a discovered resource.
+
+    For everything Engram can't auto-detect (click-ops ECS services, an EC2
+    that "just runs prod", an RDS with no tags), tell Engram once. Every
+    future `assess` and `infra_context` call uses the annotation.
+
+    The TARGET can be:
+
+        \b
+        resource UID:               46c1f3e828e25c97f2cf
+        kind + name:                aws:rds:DBInstance:payments-prod
+        kind + namespace + name:    k8s:Deployment:prod:payments
+        bare name (if unique):      payments-prod
+
+    Examples:
+
+        \b
+        engram annotate aws:rds:DBInstance:payments-prod --env production --owner platform
+        engram annotate k8s:Deployment:prod:payments --runbook https://example.com/run
+        engram annotate ec2-12345 --note "legacy box, ssh as ubuntu, redeploy via fab"
+    """
+    from engram.graph import get_user_annotations, remove_user_annotation, upsert_user_annotation
+
+    cfg = load_config()
+    if not cfg.db_path.exists():
+        console.print("[yellow]No database. Run [bold]engram init[/bold] first.[/yellow]")
+        sys.exit(1)
+    conn = open_db(cfg)
+
+    target_uid = _resolve_annotation_target(conn, target)
+    if not target_uid:
+        console.print(f"[red]No resource matched '{target}'.[/red]")
+        console.print(
+            "Try `engram status` to confirm the resource exists, or one of the "
+            "TARGET shapes shown in --help."
+        )
+        sys.exit(1)
+
+    if remove:
+        n = remove_user_annotation(conn, target_uid)
+        console.print(f"[green]Removed {n} annotation(s) from {target_uid}.[/green]")
+        return
+
+    updates: list[tuple[str, str]] = []
+    if environment:
+        updates.append(("environment", environment))
+    if owner:
+        updates.append(("owner", owner))
+    if runbook:
+        updates.append(("runbook", runbook))
+    if note:
+        updates.append(("note", note))
+    if extra_key and extra_value:
+        updates.append((extra_key, extra_value))
+
+    if not updates:
+        existing = get_user_annotations(conn, target_uid)
+        if not existing:
+            console.print(
+                "[yellow]No annotation flags given and no existing annotations to show.[/yellow]\n"
+                "Use --env, --owner, --runbook, --note, or --key/--value."
+            )
+            return
+        table = Table(title=f"Annotations on {target_uid}", border_style="blue", show_header=True)
+        table.add_column("Key", style="bold")
+        table.add_column("Value")
+        for k, v in sorted(existing.items()):
+            table.add_row(k, v)
+        console.print(table)
+        return
+
+    for key, value in updates:
+        upsert_user_annotation(conn, target_uid=target_uid, key=key, value=value)
+    console.print(
+        f"[green]Annotated[/green] {target_uid} with: "
+        + ", ".join(f"{k}={v!r}" for k, v in updates)
+    )
+
+
+def _resolve_annotation_target(conn, target: str) -> str | None:
+    """Resolve a user-facing TARGET string to a resource UID.
+
+    Tries (in order):
+      1. literal UID match
+      2. `kind:name`  or  `kind:namespace:name`
+      3. unique `name` match
+    """
+    # 1. literal UID.
+    row = conn.execute("SELECT uid FROM resource WHERE uid = ?", (target,)).fetchone()
+    if row:
+        return row["uid"]
+
+    # 2. structured kind[:namespace]:name.
+    if ":" in target:
+        parts = target.split(":")
+        # Try as kind:name (kind has its own colons like aws:rds:DBInstance:foo).
+        # We greedily consume from the start: try the last token as `name`, the rest as `kind`.
+        if len(parts) >= 2:
+            name = parts[-1]
+            kind_or_ns = ":".join(parts[:-1])
+            # Try `kind = kind_or_ns, name = name` directly.
+            row = conn.execute(
+                "SELECT uid FROM resource WHERE kind = ? AND name = ? LIMIT 1",
+                (kind_or_ns, name),
+            ).fetchone()
+            if row:
+                return row["uid"]
+            # Try `kind = kind_or_ns minus last segment as namespace, namespace = that, name = name`.
+            if ":" in kind_or_ns:
+                kind = ":".join(kind_or_ns.split(":")[:-1])
+                namespace = kind_or_ns.split(":")[-1]
+                row = conn.execute(
+                    "SELECT uid FROM resource WHERE kind = ? AND namespace = ? AND name = ? LIMIT 1",
+                    (kind, namespace, name),
+                ).fetchone()
+                if row:
+                    return row["uid"]
+
+    # 3. unique bare name.
+    rows = conn.execute(
+        "SELECT uid FROM resource WHERE name = ? LIMIT 2", (target,),
+    ).fetchall()
+    if len(rows) == 1:
+        return rows[0]["uid"]
+    if len(rows) > 1:
+        console.print(
+            f"[yellow]Name '{target}' is ambiguous ({len(rows)} matches). "
+            "Use kind:name or kind:namespace:name.[/yellow]"
+        )
+        return None
+    return None
+
+
+@cli.command(name="infer")
+@click.option("--min-score", default=0.6, show_default=True,
+              help="Minimum match score (0..1) to accept inferred edges.")
+def infer(min_score: float) -> None:
+    """Re-run the value-match inference pass.
+
+    Walks every env_var / env_ref / secret_ref entity in the graph and
+    matches its value against the endpoint / DNS / ARN / bucket-name of
+    every discovered cloud Resource. New matches become DEPENDS_ON edges
+    tagged `inferred_from: value_match`.
+
+    Idempotent. Safe to re-run anytime.
+    """
+    from engram.inference.value_match import infer_value_matches
+
+    cfg = load_config()
+    if not cfg.db_path.exists():
+        console.print("[yellow]No database. Run [bold]engram init[/bold] first.[/yellow]")
+        sys.exit(1)
+    conn = open_db(cfg)
+    with console.status("[bold green]Inferring value matches..."):
+        stats = infer_value_matches(conn, min_score=min_score)
+
+    table = Table(title="Value-Match Inference", border_style="green", show_header=False)
+    table.add_column("Metric", style="bold")
+    table.add_column("Count", justify="right")
+    table.add_row("Entities scanned", str(stats.entities_scanned))
+    table.add_row("Resources indexed", str(stats.resources_indexed))
+    table.add_row("Hostname/ARN candidates extracted", str(stats.candidates_extracted))
+    table.add_row("Edges inferred", str(stats.edges_inferred))
+    table.add_row("Skipped: too short", str(stats.skipped_too_short))
+    table.add_row("Skipped: score below threshold", str(stats.skipped_low_score))
+    console.print(table)
+
+
+@cli.command()
 @click.argument("operation")
 @click.argument("target")
 def assess(operation: str, target: str) -> None:
@@ -339,9 +523,13 @@ def diagnose() -> None:
 @cli.command(name="import-cloud")
 @click.option("--provider", type=click.Choice(["aws"]), default="aws",
               show_default=True, help="Cloud provider to discover.")
-@click.option("--kinds", "-k", default="rds,ec2,s3,eks,lambda,elb,ecs,sqs,sns,dynamodb",
+@click.option("--kinds", "-k",
+              default="rds,ec2,s3,eks,lambda,elb,ecs,sqs,sns,dynamodb,"
+                      "vpc,subnet,sg,iam,secrets,route53",
               show_default=True,
-              help="Comma-separated list of resource kinds.")
+              help=("Comma-separated kinds. v0.2: rds, ec2, s3, eks, lambda, "
+                    "elb, ecs, sqs, sns, dynamodb. v0.3 adds: vpc, subnet, "
+                    "sg, iam, secrets, route53."))
 @click.option("--region", default=None,
               help="AWS region (default: read from AWS CLI config).")
 @click.option("--profile", default=None,
@@ -394,6 +582,17 @@ def import_cloud(provider: str, kinds: str, region: str | None,
             "[yellow]No resources found. If you expected some, check `aws sts "
             "get-caller-identity` and the --region.[/yellow]"
         )
+
+    # Auto-run value-match inference so newly-discovered cloud resources
+    # immediately get linked to env-var references in source.
+    if stats.inserted > 0:
+        from engram.inference.value_match import infer_value_matches
+        vm = infer_value_matches(conn)
+        if vm.edges_inferred:
+            console.print(
+                f"\n[bold]Inferred {vm.edges_inferred} new DEPENDS_ON edge(s)[/bold] "
+                f"by matching env-var values to discovered resource endpoints."
+            )
 
 
 @cli.command(name="import-cluster")

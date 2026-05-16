@@ -95,6 +95,21 @@ def index_paths(
 
     # Post-pass: link env_var defs to env_ref consumers across files.
     _build_env_edges(conn, stats)
+
+    # Post-pass: value-match inference. Links env-var/secret values to
+    # cloud Resources whose endpoint/ARN/dns_name appears in the value.
+    # Cheap if no cloud resources have been imported (just iterates entities).
+    try:
+        from engram.inference.value_match import infer_value_matches
+        vm_stats = infer_value_matches(conn)
+        if vm_stats.edges_inferred:
+            logger.info(
+                "value-match inference: %d edges inferred from %d candidates",
+                vm_stats.edges_inferred, vm_stats.candidates_extracted,
+            )
+    except Exception as exc:
+        logger.warning("value-match inference failed: %s", exc)
+
     return stats
 
 

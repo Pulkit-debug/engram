@@ -1,0 +1,33 @@
+# Scenario replay for the cert-manager/cert-manager repo.
+# Source: https://github.com/cert-manager/cert-manager
+# Shape: Go + Helm + Make + K8s manifests + test fixtures
+
+- name: helm_uninstall_cert_manager_cross_format
+  operation: "helm uninstall"
+  target: "cert-manager"
+  expected_tier: "orange"
+  expected_action: "confirm"
+  min_resources: 3
+  rationale: "cert-manager is a cross-format service (helm chart + namespace + makefile). At least 3 resources resolve."
+
+- name: delete_bind_test_deployment
+  operation: "kubectl delete deployment"
+  target: "bind"
+  expected_tier: "orange"
+  expected_action: "confirm"
+  min_resources: 2
+  rationale: "Cross-format test fixture (ConfigMap + Deployment). Destructive → confirm."
+
+- name: kubectl_apply_cert_manager
+  operation: "kubectl apply"
+  target: "cert-manager"
+  expected_tier: "green"
+  expected_action: "proceed"
+  rationale: "Mutating op on green resource (no prod marker)."
+
+- name: kubectl_describe_cert_manager
+  operation: "kubectl describe deployment"
+  target: "cert-manager"
+  expected_tier: "green"
+  expected_action: "proceed"
+  rationale: "Read-only describe."

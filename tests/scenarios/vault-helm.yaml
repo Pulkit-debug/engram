@@ -1,0 +1,45 @@
+# Scenario replay for the hashicorp/vault-helm repo.
+# Each scenario asserts the (tier, action) Engram returns for a real
+# operation against a real target found in the indexed graph.
+#
+# Source repo: https://github.com/hashicorp/vault-helm
+# Resource shape: pure Helm chart + test fixtures (k8s manifests + tf for cluster setup)
+
+- name: destroy_postgres_test_fixture
+  operation: "kubectl delete deployment"
+  target: "postgres"
+  expected_tier: "orange"
+  expected_action: "confirm"
+  min_resources: 2
+  rationale: "Cross-format service (k8s:Service + k8s:Deployment). Destructive op, no prod marker → confirm."
+
+- name: helm_uninstall_vault
+  operation: "helm uninstall"
+  target: "vault"
+  expected_tier: "orange"
+  expected_action: "confirm"
+  min_resources: 1
+  rationale: "Vault chart resolves. Destructive without prod marker → confirm."
+
+- name: read_nginx_pods
+  operation: "kubectl get pods"
+  target: "nginx"
+  expected_tier: "green"
+  expected_action: "proceed"
+  rationale: "Read-only op; safe regardless of resource."
+
+- name: unknown_target_no_env_hint
+  operation: "terraform destroy"
+  target: "xyz-undefined-resource"
+  expected_tier: "orange"
+  expected_action: "confirm"
+  max_resources: 0
+  rationale: "Target not found AND target name has no env hints → biased to confirm so the human is asked."
+
+- name: unknown_target_with_prod_in_name
+  operation: "terraform destroy"
+  target: "totally-fake-prod-db"
+  expected_tier: "red"
+  expected_action: "block"
+  max_resources: 0
+  rationale: "Target not found but name contains 'prod' segment → Engram is correctly cautious and blocks. Demonstrates name-based environment inference is conservative."

@@ -100,6 +100,7 @@ def import_aws(
     region = region or _aws_default_region(aws_cli, profile)
 
     importers: dict[str, Callable] = {
+        # Original 10 (v0.2)
         "rds":      _import_rds,
         "ec2":      _import_ec2,
         "s3":       _import_s3,
@@ -110,6 +111,13 @@ def import_aws(
         "sqs":      _import_sqs,
         "sns":      _import_sns,
         "dynamodb": _import_dynamodb,
+        # v0.3: network + access + secrets surface
+        "vpc":      _import_vpc,
+        "subnet":   _import_subnet,
+        "sg":       _import_security_groups,
+        "iam":      _import_iam,
+        "secrets":  _import_secrets,
+        "route53":  _import_route53,
     }
 
     for kind in kinds:
@@ -331,6 +339,231 @@ def _import_dynamodb(conn, stats, *, account, region, profile, aws_cli) -> int:
         _insert_resource(conn, "dynamodb", table_name, env, {},
                          account, region, "aws:dynamodb:Table")
         count += 1
+    stats.discovered += count
+    stats.inserted += count
+    return count
+
+
+# ---------------------------------------------------------------------------
+# v0.3 — Network + access + secrets surface
+# ---------------------------------------------------------------------------
+
+def _import_vpc(conn, stats, *, account, region, profile, aws_cli) -> int:
+    """VPCs. The top of the network blast-radius tree."""
+    out = _aws_json(aws_cli, profile, region, ["ec2", "describe-vpcs"])
+    count = 0
+    for vpc in out.get("Vpcs", []):
+        vpc_id = vpc.get("VpcId", "")
+        tags = _tags_to_dict(vpc.get("Tags") or [])
+        name = tags.get("Name") or vpc_id
+        if not name:
+            continue
+        env = _env_from_tags(tags) or _env_from_name(name)
+        props = {
+            "vpc_id": vpc_id,
+            "cidr_block": vpc.get("CidrBlock", ""),
+            "is_default": vpc.get("IsDefault", False),
+            "state": vpc.get("State", ""),
+            "tags": tags,
+        }
+        _insert_resource(conn, "vpc", name, env, props, account, region, "aws:ec2:VPC")
+        count += 1
+    stats.discovered += count
+    stats.inserted += count
+    return count
+
+
+def _import_subnet(conn, stats, *, account, region, profile, aws_cli) -> int:
+    out = _aws_json(aws_cli, profile, region, ["ec2", "describe-subnets"])
+    count = 0
+    for sn in out.get("Subnets", []):
+        subnet_id = sn.get("SubnetId", "")
+        tags = _tags_to_dict(sn.get("Tags") or [])
+        name = tags.get("Name") or subnet_id
+        if not name:
+            continue
+        env = _env_from_tags(tags) or _env_from_name(name)
+        props = {
+            "subnet_id": subnet_id,
+            "vpc_id": sn.get("VpcId", ""),
+            "cidr_block": sn.get("CidrBlock", ""),
+            "availability_zone": sn.get("AvailabilityZone", ""),
+            "tags": tags,
+        }
+        _insert_resource(conn, "subnet", name, env, props, account, region, "aws:ec2:Subnet")
+        count += 1
+    stats.discovered += count
+    stats.inserted += count
+    return count
+
+
+def _import_security_groups(conn, stats, *, account, region, profile, aws_cli) -> int:
+    """Security groups. Deleting one orphans every service depending on it."""
+    out = _aws_json(aws_cli, profile, region, ["ec2", "describe-security-groups"])
+    count = 0
+    for sg in out.get("SecurityGroups", []):
+        sg_id = sg.get("GroupId", "")
+        sg_name = sg.get("GroupName", "")
+        tags = _tags_to_dict(sg.get("Tags") or [])
+        # Prefer Name tag, then GroupName, then GroupId.
+        name = tags.get("Name") or sg_name or sg_id
+        if not name:
+            continue
+        env = _env_from_tags(tags) or _env_from_name(name)
+        # Summarize ingress / egress rules count (full rules are noisy in props).
+        ingress = sg.get("IpPermissions") or []
+        egress = sg.get("IpPermissionsEgress") or []
+        props = {
+            "group_id": sg_id,
+            "group_name": sg_name,
+            "vpc_id": sg.get("VpcId", ""),
+            "description": sg.get("Description", ""),
+            "ingress_rule_count": len(ingress),
+            "egress_rule_count": len(egress),
+            "tags": tags,
+        }
+        _insert_resource(conn, "sg", name, env, props,
+                         account, region, "aws:ec2:SecurityGroup")
+        count += 1
+    stats.discovered += count
+    stats.inserted += count
+    return count
+
+
+def _import_iam(conn, stats, *, account, region, profile, aws_cli) -> int:
+    """IAM roles. (Region-independent — IAM is global; we use 'global' as namespace.)"""
+    # IAM is a global service; the --region argument is meaningless here.
+    out = _aws_json(aws_cli, profile, None, ["iam", "list-roles"])
+    count = 0
+    for role in out.get("Roles", []):
+        name = role.get("RoleName", "")
+        if not name:
+            continue
+        env = _env_from_name(name)
+        props = {
+            "arn": role.get("Arn", ""),
+            "role_id": role.get("RoleId", ""),
+            "path": role.get("Path", ""),
+            "create_date": role.get("CreateDate", ""),
+        }
+        # Use 'global' as the region/namespace marker for IAM.
+        _insert_resource(conn, "iam", name, env, props,
+                         account, "global", "aws:iam:Role")
+        count += 1
+    stats.discovered += count
+    stats.inserted += count
+    return count
+
+
+def _import_secrets(conn, stats, *, account, region, profile, aws_cli) -> int:
+    """SecretsManager + SSM Parameter Store — the AWS-native env-var equivalent."""
+    count = 0
+
+    # SecretsManager.
+    out = _aws_json(aws_cli, profile, region,
+                    ["secretsmanager", "list-secrets"])
+    for sec in out.get("SecretList", []):
+        name = sec.get("Name", "")
+        if not name:
+            continue
+        env = _env_from_name(name)
+        props = {
+            "arn": sec.get("ARN", ""),
+            "description": sec.get("Description", ""),
+            "last_changed": sec.get("LastChangedDate", ""),
+            "tags": _tags_to_dict(sec.get("Tags") or []),
+        }
+        _insert_resource(conn, "secrets", name, env, props,
+                         account, region, "aws:secretsmanager:Secret")
+        count += 1
+
+    # SSM Parameter Store (best-effort; some accounts won't have any).
+    try:
+        out = _aws_json(aws_cli, profile, region,
+                        ["ssm", "describe-parameters"])
+        for p in out.get("Parameters", []):
+            name = p.get("Name", "")
+            if not name:
+                continue
+            env = _env_from_name(name)
+            props = {
+                "type": p.get("Type", ""),
+                "tier": p.get("Tier", ""),
+                "last_modified": p.get("LastModifiedDate", ""),
+                "version": p.get("Version", 0),
+            }
+            _insert_resource(conn, "secrets", name, env, props,
+                             account, region, "aws:ssm:Parameter")
+            count += 1
+    except _AwsCliError:
+        # SSM may not be available; not fatal.
+        pass
+
+    stats.discovered += count
+    stats.inserted += count
+    return count
+
+
+def _import_route53(conn, stats, *, account, region, profile, aws_cli) -> int:
+    """Route53 zones + record sets. DNS is the biggest blind spot in click-ops shops.
+
+    Endpoints from RDS / ELB / CloudFront ultimately flow through Route53 records.
+    Indexing them lets value_match.py connect env-var hostnames to the resources
+    behind them.
+    """
+    # Route53 is global; the --region argument is ignored.
+    out = _aws_json(aws_cli, profile, None, ["route53", "list-hosted-zones"])
+    count = 0
+    for zone in out.get("HostedZones", []):
+        zone_id = zone.get("Id", "").rsplit("/", 1)[-1]
+        name = (zone.get("Name") or "").rstrip(".")
+        if not name:
+            continue
+        env = _env_from_name(name)
+        zone_props = {
+            "zone_id": zone_id,
+            "private_zone": zone.get("Config", {}).get("PrivateZone", False),
+            "record_count": zone.get("ResourceRecordSetCount", 0),
+        }
+        _insert_resource(conn, "route53", name, env, zone_props,
+                         account, "global", "aws:route53:HostedZone")
+        count += 1
+
+        # Drill into record sets (best-effort; can be slow on large zones).
+        try:
+            rs_out = _aws_json(
+                aws_cli, profile, None,
+                ["route53", "list-resource-record-sets", "--hosted-zone-id", zone_id],
+            )
+            for rrset in rs_out.get("ResourceRecordSets", []):
+                rec_name = (rrset.get("Name") or "").rstrip(".")
+                rec_type = rrset.get("Type", "")
+                if not rec_name or rec_type not in ("A", "AAAA", "CNAME", "ALIAS"):
+                    continue
+                # Pull the actual values — these are what env vars match against.
+                values: list[str] = []
+                for rr in rrset.get("ResourceRecords") or []:
+                    if isinstance(rr, dict) and rr.get("Value"):
+                        values.append(rr["Value"])
+                alias_target = rrset.get("AliasTarget")
+                if alias_target and alias_target.get("DNSName"):
+                    values.append(alias_target["DNSName"].rstrip("."))
+                record_env = _env_from_name(rec_name)
+                rec_props = {
+                    "record_type": rec_type,
+                    "ttl": rrset.get("TTL", 0),
+                    "dns_name": rec_name,
+                    "values": values,
+                    "alias": bool(alias_target),
+                }
+                # Critically: store the *value* (target hostname) in dns_name
+                # so value_match.py can link env vars pointing at it.
+                _insert_resource(conn, "route53", rec_name, record_env, rec_props,
+                                 account, "global", f"aws:route53:RecordSet:{rec_type}")
+                count += 1
+        except _AwsCliError:
+            pass
+
     stats.discovered += count
     stats.inserted += count
     return count

@@ -1,0 +1,34 @@
+# Scenario replay for docker/awesome-compose.
+# Source: https://github.com/docker/awesome-compose
+# Shape: ~80 docker-compose.yml examples, many small applications.
+
+- name: down_nginx_compose_service
+  operation: "docker compose down"
+  target: "nginx"
+  expected_tier: "orange"
+  expected_action: "confirm"
+  min_resources: 2
+  rationale: "nginx appears as both compose:service and docker:image. Destructive → confirm."
+
+- name: down_prometheus_compose
+  operation: "docker compose down"
+  target: "prometheus"
+  expected_tier: "orange"
+  expected_action: "confirm"
+  min_resources: 1
+  rationale: "Prometheus compose service exists. Destructive op → confirm."
+
+- name: ps_is_read_only
+  operation: "docker compose ps"
+  target: "nginx"
+  expected_tier: "green"
+  expected_action: "proceed"
+  rationale: "compose ps is read-only (verified ps is in the read-verb set)."
+
+- name: down_unknown_service
+  operation: "docker compose down"
+  target: "made-up-service-xyz"
+  expected_tier: "orange"
+  expected_action: "confirm"
+  max_resources: 0
+  rationale: "Unknown target on destructive → confirm."

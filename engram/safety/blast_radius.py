@@ -49,6 +49,9 @@ _MUTATING_VERBS = frozenset({
 # Verbs that are safe.
 _READ_VERBS = frozenset({
     "get", "list", "describe", "show", "plan", "diff", "logs", "status",
+    "ps", "inspect", "history", "events", "top", "config", "explain",
+    "version", "info", "validate", "lint", "fmt", "view", "read",
+    "template", "render", "search", "help", "completion",
 })
 
 
@@ -230,27 +233,45 @@ def assess(
         resources = find_resources_for_service(conn, target)
     result.resolved_resources = resources
 
-    # Step 2: infer environment & file-level tier.
-    # Prefer explicit Resource.environment; fall back to path inference.
-    envs = {r.get("environment", "") for r in resources if r.get("environment")}
-    if envs:
-        # If any resolved resource is production, the operation is production.
-        if "production" in envs:
-            result.environment = "production"
-        elif "staging" in envs:
-            result.environment = "staging"
-        else:
-            result.environment = next(iter(envs))
+    # Step 2: collect user annotations on resolved resources. These are the
+    # "tell Engram what only you know" facts for click-ops resources.
+    # User-set environment OVERRIDES auto-inferred environment.
+    from engram.graph import get_user_annotations
+    user_annotations_by_uid: dict[str, dict[str, str]] = {}
+    for r in resources:
+        anns = get_user_annotations(conn, r["uid"])
+        if anns:
+            user_annotations_by_uid[r["uid"]] = anns
+
+    # Step 3: infer environment.
+    # Priority: user-set environment > Resource.environment column > path inference.
+    user_envs = {
+        anns.get("environment", "") for anns in user_annotations_by_uid.values()
+        if anns.get("environment")
+    }
+    if "production" in user_envs:
+        result.environment = "production"
+    elif "staging" in user_envs:
+        result.environment = "staging"
+    elif user_envs:
+        result.environment = next(iter(user_envs))
     else:
-        # Fall back to inferring from any resolved resource's file path.
-        for r in resources:
-            inferred = infer_environment_from_path(r.get("file_path", ""))
-            if inferred:
-                result.environment = inferred
-                break
-        # If still unknown, try inferring from the target string itself.
-        if not result.environment:
-            result.environment = infer_environment_from_path(target)
+        envs = {r.get("environment", "") for r in resources if r.get("environment")}
+        if envs:
+            if "production" in envs:
+                result.environment = "production"
+            elif "staging" in envs:
+                result.environment = "staging"
+            else:
+                result.environment = next(iter(envs))
+        else:
+            for r in resources:
+                inferred = infer_environment_from_path(r.get("file_path", ""))
+                if inferred:
+                    result.environment = inferred
+                    break
+            if not result.environment:
+                result.environment = infer_environment_from_path(target)
 
     # Step 3: dependents (1-hop) for each resolved resource.
     seen_keys: set[tuple[str, str]] = set()
@@ -322,6 +343,16 @@ def assess(
         result.reasons.append(
             f"{len(result.incident_refs)} prior incident/runbook memory(s) mention this target."
         )
+
+    # Surface user annotations — they're the "I told Engram so" reasons.
+    for uid, anns in user_annotations_by_uid.items():
+        if "owner" in anns:
+            result.reasons.append(f"User-set owner: {anns['owner']}.")
+        if "runbook" in anns:
+            result.reasons.append(f"User-attached runbook: {anns['runbook']}")
+        if "note" in anns:
+            result.reasons.append(f"User note: {anns['note']}")
+        # environment is already surfaced via the env line above.
 
     return result
 

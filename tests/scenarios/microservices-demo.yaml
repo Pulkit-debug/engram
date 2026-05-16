@@ -1,0 +1,51 @@
+# Scenario replay for GoogleCloudPlatform/microservices-demo.
+# Source: https://github.com/GoogleCloudPlatform/microservices-demo
+# Shape: Multi-service realistic app (Online Boutique). K8s + Docker + Terraform + Skaffold + Istio.
+# This is the showcase repo for Engram's cross-format service detection.
+
+- name: delete_frontend_spans_six_formats
+  operation: "kubectl delete deployment"
+  target: "frontend"
+  expected_tier: "orange"
+  expected_action: "confirm"
+  min_resources: 6
+  rationale: "frontend is a cross-format service spanning Deployment+Service+ServiceAccount+VirtualService+ServiceEntry+NetworkPolicy. Killer demo of the joiner."
+
+- name: delete_paymentservice
+  operation: "kubectl delete deployment"
+  target: "paymentservice"
+  expected_tier: "orange"
+  expected_action: "confirm"
+  min_resources: 5
+  rationale: "paymentservice spans 5 formats. Real value: agent sees full surface before destroy."
+
+- name: delete_redis_cart_spans_tf_and_k8s
+  operation: "kubectl delete deployment"
+  target: "redis-cart"
+  expected_tier: "orange"
+  expected_action: "confirm"
+  min_resources: 4
+  rationale: "redis-cart spans tf:google_redis_instance AND k8s:Deployment+Service+NetworkPolicy. Source IaC + cluster definition in one resolve."
+
+- name: read_pods_is_safe
+  operation: "kubectl get pods"
+  target: "frontend"
+  expected_tier: "green"
+  expected_action: "proceed"
+  rationale: "Read-only — safe even against the 6-format frontend service."
+
+- name: delete_checkoutservice
+  operation: "kubectl delete deployment"
+  target: "checkoutservice"
+  expected_tier: "orange"
+  expected_action: "confirm"
+  min_resources: 5
+  rationale: "Another 5-format service; consistency check."
+
+- name: delete_unknown_kubernetes_service
+  operation: "kubectl delete deployment"
+  target: "billingservice"
+  expected_tier: "orange"
+  expected_action: "confirm"
+  max_resources: 0
+  rationale: "Service that doesn't exist in this repo → confirm."

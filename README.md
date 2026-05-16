@@ -49,26 +49,56 @@ Wire this into Claude Code or Cursor as an MCP server with one command. Now ever
 
 ## Works for clicked-into-existence infrastructure too
 
-Most production resources weren't created from Terraform — they were clicked into
-existence in the AWS console, or `kubectl apply`-d once and never tracked. Engram
-covers this without breaking the local-first promise: it doesn't talk to your
-cloud, but it parses the output of *your* `aws` and `kubectl` CLIs (using *your*
-existing credentials).
+Most production resources weren't created from Terraform — they were clicked
+into existence in the AWS console, or `kubectl apply`-d once and never
+tracked. Engram covers this without breaking the local-first promise: it
+doesn't talk to your cloud, but it parses the output of *your* `aws` and
+`kubectl` CLIs (using *your* existing credentials).
+
+### Three commands close the click-ops gap
 
 ```bash
-engram import-cloud --provider aws --kinds rds,s3,eks
+# 1. Discover from your cloud. (Network, access, secrets, DNS — not just RDS/EC2.)
+engram import-cloud --provider aws \
+    --kinds rds,ec2,s3,eks,lambda,elb,ecs,sqs,sns,dynamodb,vpc,subnet,sg,iam,secrets,route53
+
+# 2. Discover from a live cluster.
 engram import-cluster --context prod
-engram assess "terraform destroy" "users-prod"        # finds it whether or not it's in IaC
+
+# 3. Bolt on what only YOU know about that legacy EC2 box.
+engram annotate aws:rds:DBInstance:users-untagged \
+    --env production --owner platform --runbook https://example.com/runbook
 ```
 
-Discovered resources are tagged `discovered_from = "aws-cli"` / `"kubectl"` so
-you can tell them apart from IaC-defined ones. Same `blast_radius` primitive
-applies — production tags trigger `red` regardless of how the resource was
-created.
+### The pioneer feature — value-match inference
 
-See [docs/HOW_IT_UNDERSTANDS_TYPES.md](docs/HOW_IT_UNDERSTANDS_TYPES.md) for
-the honest answer to "wait, is this an AI?" (no — it's a type-aware indexer
-that trusts the type tags already in your YAML/HCL/JSON).
+When your `.env` says `DATABASE_URL=postgres://payments-prod.cluster-x.us-east-1.rds.amazonaws.com:5432/foo`
+and an `import-cloud` run discovered an RDS with that exact endpoint, Engram
+automatically creates a DEPENDS_ON edge between the file and the RDS — **with
+no Terraform linking them**.
+
+```bash
+engram import-cloud --provider aws --kinds rds
+engram infer                             # runs the matcher (auto-run after every index)
+engram assess "terraform destroy" "payments-prod"
+#  → Resources: 1; Dependents: 3 (.env file + service manifests via the inferred edge)
+```
+
+This is what makes Engram work for the median company that has zero
+discipline about Terraform but *does* have env vars pointing at real AWS
+resources. Cross-format dependency tracking without IaC.
+
+Discovered resources are tagged `discovered_from = "aws-cli"` / `"kubectl"`
+so you can tell them apart from IaC-defined ones. User annotations *override*
+auto-inferred environment — the person typing `engram annotate` knows things
+the tag doesn't.
+
+See [docs/CLICK_OPS.md](docs/CLICK_OPS.md) for the full story,
+[docs/HOW_IT_UNDERSTANDS_TYPES.md](docs/HOW_IT_UNDERSTANDS_TYPES.md) for the
+honest answer to "wait, is this an AI?" (it isn't — it's a type-aware
+indexer that trusts your YAML/HCL), and
+[docs/DIRECTORS_BRIEF.md](docs/DIRECTORS_BRIEF.md) for the version you hand
+to a CTO.
 
 ---
 

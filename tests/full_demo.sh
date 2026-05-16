@@ -23,8 +23,10 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 # Pick the engram CLI. Prefer the project's venv; fall back to PATH.
 if [[ -x "$PROJECT_DIR/.venv/bin/engram" ]]; then
     ENGRAM="$PROJECT_DIR/.venv/bin/engram"
+    PY="$PROJECT_DIR/.venv/bin/python3"
 elif command -v engram >/dev/null 2>&1; then
     ENGRAM="$(command -v engram)"
+    PY="$(command -v python3 || command -v python)"
 else
     echo "ERROR: engram CLI not found. Install with 'pipx install engram-devops' or set up the project venv." >&2
     exit 1
@@ -108,7 +110,7 @@ grep -q "engram.io/" "$K8S_FILE" && fail "label not fully removed" || true
 ok "label/unlabel round-trip preserved file"
 
 # -------------------------------------------------------------------------
-hr "9/9   mcp install --target all --dry-run  (no actual writes)"
+hr "9/11  mcp install --target all --dry-run  (no actual writes)"
 # -------------------------------------------------------------------------
 MCP_OUT="$("$ENGRAM" mcp install --target all --dry-run 2>&1)"
 echo "$MCP_OUT"
@@ -116,7 +118,82 @@ echo "$MCP_OUT" | grep -q "claude-code" || fail "claude-code target missing"
 echo "$MCP_OUT" | grep -q "cursor" || fail "cursor target missing"
 ok "MCP install plan generated for all targets"
 
-hr "  RESULT: all 9 checks passed"
+# -------------------------------------------------------------------------
+hr "10/11 user annotation promotes click-ops resource to RED"
+# -------------------------------------------------------------------------
+"$PY" - <<'PYEOF'
+from engram.config import load_config
+from engram.db import open_db
+from engram.graph import (FileRow, ProjectRow, ResourceRow,
+    resource_uid, upsert_file, upsert_project, upsert_resource)
+cfg = load_config()
+conn = open_db(cfg)
+upsert_project(conn, ProjectRow(path="", name="cloud"))
+fp = "aws://demo/us-east-1/rds"
+upsert_file(conn, FileRow(path=fp, project_path="", name="aws:rds",
+    extension="", size_bytes=0, content_hash="x",
+    modified_at="2026-05-16T00:00:00Z"))
+uid = resource_uid("aws:rds:DBInstance", "demo-click-ops-db", "us-east-1", fp)
+upsert_resource(conn, ResourceRow(uid=uid, file_path=fp,
+    kind="aws:rds:DBInstance", name="demo-click-ops-db",
+    namespace="us-east-1", environment="", risk_tier="green",
+    properties={"discovered_from": "aws-cli"}))
+PYEOF
+
+BEFORE=$("$ENGRAM" assess "terraform destroy" "demo-click-ops-db" 2>&1)
+echo "$BEFORE" | grep -q "CONFIRM" || fail "expected CONFIRM before annotation"
+
+"$ENGRAM" annotate aws:rds:DBInstance:demo-click-ops-db \
+    --env production --owner platform-team \
+    --runbook "https://example.com/runbook" 2>&1 | tail -2
+
+AFTER=$("$ENGRAM" assess "terraform destroy" "demo-click-ops-db" 2>&1)
+echo "$AFTER" | head -10
+echo "$AFTER" | grep -q "BLOCK" || fail "expected BLOCK after env=production annotation"
+echo "$AFTER" | grep -q "platform-team" || fail "expected owner annotation in reasons"
+ok "user annotation promoted resource from CONFIRM to BLOCK"
+
+# -------------------------------------------------------------------------
+hr "11/11 value-match inference (pioneer feature)"
+# -------------------------------------------------------------------------
+"$PY" - <<'PYEOF'
+from engram.config import load_config
+from engram.db import open_db
+from engram.graph import (EntityRow, FileRow, ProjectRow, ResourceRow,
+    entity_uid, resource_uid, upsert_entity, upsert_file,
+    upsert_project, upsert_resource)
+cfg = load_config()
+conn = open_db(cfg)
+upsert_project(conn, ProjectRow(path="/repo/payments", name="payments"))
+upsert_file(conn, FileRow(path="/repo/payments/.env", project_path="/repo/payments",
+    name=".env", extension=".env", size_bytes=10, content_hash="h",
+    modified_at="2026-05-16T00:00:00Z"))
+fp = "aws://demo/us-east-1/rds-payments"
+upsert_file(conn, FileRow(path=fp, project_path="", name="aws:rds",
+    extension="", size_bytes=0, content_hash="y",
+    modified_at="2026-05-16T00:00:00Z", risk_tier="red"))
+rds_uid = resource_uid("aws:rds:DBInstance", "payments-prod", "us-east-1", fp)
+upsert_resource(conn, ResourceRow(uid=rds_uid, file_path=fp,
+    kind="aws:rds:DBInstance", name="payments-prod",
+    namespace="us-east-1", environment="production", risk_tier="red",
+    properties={"endpoint": "payments-prod.cluster.us-east-1.rds.amazonaws.com",
+                "discovered_from": "aws-cli"}))
+upsert_entity(conn, EntityRow(
+    uid=entity_uid("DATABASE_URL", "env_var", "/repo/payments/.env"),
+    file_path="/repo/payments/.env",
+    name="DATABASE_URL", entity_type="env_var",
+    value="postgres://payments-prod.cluster.us-east-1.rds.amazonaws.com:5432/p"))
+PYEOF
+
+"$ENGRAM" infer 2>&1 | tail -6
+
+INFER_OUT=$("$ENGRAM" assess "terraform destroy" "payments-prod" 2>&1)
+echo "$INFER_OUT" | head -10
+echo "$INFER_OUT" | grep -q "BLOCK" || fail "expected BLOCK for prod-tagged RDS"
+echo "$INFER_OUT" | grep -qE "Dependents:[[:space:]]*[1-9]" || fail "expected >= 1 inferred dependent"
+ok "value-match inferred a DEPENDS_ON edge; blast_radius surfaced it"
+
+hr "  RESULT: all 11 checks passed"
 echo
 echo "  Database:    $DB/engram.db"
 echo "  Fixture:     $FIXTURE"

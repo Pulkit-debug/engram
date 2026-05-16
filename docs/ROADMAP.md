@@ -1,4 +1,92 @@
-# Engram v0.2 — Build status
+# Engram — Build status
+
+## v0.3 — Click-ops, benchmarks, sales material (SHIPPED ✓)
+
+The strategic phase. Three things the v0.2 release deferred:
+
+### Director's Brief (`docs/DIRECTORS_BRIEF.md`)
+
+The conversion document for tech-fluent buyers (CTO, VP-of-Eng, recruiter,
+non-engineer decider). Every smart objection — "why not just prompt?", "why
+not AWS Config?", "doesn't Cursor already do this?" — answered before they
+raise it. 2,500 words, anti-defensive tone, ready to paste into a LinkedIn
+article.
+
+### Real-repo benchmarks (`docs/BENCHMARKS.md`)
+
+Indexed 6 deliberately-different OSS DevOps repositories:
+
+- hashicorp/vault-helm — pure Helm
+- cert-manager/cert-manager — Go + Helm + K8s + Make
+- terraform-aws-modules/terraform-aws-eks — pure Terraform
+- GoogleCloudPlatform/microservices-demo — multi-service realistic app
+- docker/awesome-compose — 80 docker-compose examples
+- prometheus-community/helm-charts — Helm monorepo, 48 projects
+
+Headline numbers: **1,392 files indexed in 20.5 seconds** on a budget laptop;
+**3,190 edges built**; **76 cross-format services detected**;
+**28 / 28 hand-crafted assessment scenarios pass** (5–6 per repo, asserting
+exact `(risk_tier, action)` outputs).
+
+The benchmark is reproducible via `bash tests/benchmark_real_repos.sh` and
+the scenario assertions live in `tests/test_scenario_replay.py` (28
+parametrized pytest cases).
+
+### Click-ops coverage (the IaC-coverage gap)
+
+The v0.2 release covered 10 AWS services (RDS, EC2, S3, EKS, Lambda, ELB,
+ECS, SQS, SNS, DynamoDB). v0.3 adds the *network, access, and secrets*
+surface that determines blast radius:
+
+- **VPC + Subnet + SecurityGroup** — network topology
+- **IAM Role** — access surface
+- **SecretsManager + SSM Parameter Store** — AWS-native env-var equivalent
+- **Route53 HostedZone + RecordSet** — DNS (the click-ops blind spot)
+
+### Pioneer features (genuinely new)
+
+**Value-match inference** (`engram/inference/value_match.py`):
+
+> If your `.env` file says
+> `DATABASE_URL=postgres://payments-prod.cluster.us-east-1.rds.amazonaws.com:5432/db`
+> and `engram import-cloud` discovered an RDS with that endpoint, a
+> `DEPENDS_ON` edge is auto-created between the file and the RDS — *without
+> any IaC linking them*.
+
+This is the wedge no other tool fills. Sourcegraph, Augment, AWS Learned
+Topology all miss it because they don't cross-reference env-var values
+with discovered cloud-resource endpoints. Engram does, deterministically,
+zero LLM involvement.
+
+**User annotations** (`engram annotate` CLI):
+
+For the ECS task with no Terraform, the legacy EC2 box that "just runs
+prod" — tell Engram once. The `annotation_user` table records owner,
+runbook, environment, free-text notes. Every future `assess` and
+`infra_context` call uses them; user-set environment **overrides**
+auto-inferred environment.
+
+### v0.3 test counts
+
+```
+total:                                         124 / 124 passing
+
+new in v0.3:
+  tests/test_value_match.py                      8 / 8
+  tests/test_user_annotations.py                 6 / 6
+  tests/test_aws_import_extended.py              7 / 7
+  tests/test_scenario_replay.py (parametrized) 28 / 28
+```
+
+`tests/full_demo.sh` runs **11 end-to-end checks** in under 60 seconds and
+returns `RESULT: all 11 checks passed` on a clean machine.
+
+---
+
+## v0.2 — Production hardening (SHIPPED ✓)
+
+Pushed to https://github.com/Pulkit-debug/engram. Package
+`engram-devops` ready for PyPI (token-required final step).
 
 ## Days 1-25: SHIPPED ✓
 
