@@ -505,6 +505,109 @@ def assess(operation: str, target: str) -> None:
 
 
 @cli.command()
+@click.option("--json", "as_json", is_flag=True, default=False,
+              help="Emit the report as JSON.")
+@click.option("--max-rows", default=30, show_default=True,
+              help="Max rows per section in the text output.")
+def drift(as_json: bool, max_rows: int) -> None:
+    """Show resources in cloud but not in IaC, and vice versa.
+
+    The drift report compares cloud-discovered resources (from
+    `engram import-cloud` / `engram import-cluster`) against IaC-defined
+    resources (from `engram index`). Production-tier untracked resources
+    are highlighted first.
+
+    This is the headline command for click-ops shops: "show me every
+    production resource that was clicked into existence and has no
+    Terraform / Helm / K8s manifest behind it."
+    """
+    from engram.drift import detect_drift, render_drift
+
+    cfg = load_config()
+    if not cfg.db_path.exists():
+        console.print("[yellow]No database. Run `engram init` first.[/yellow]")
+        sys.exit(1)
+    conn = open_db(cfg)
+    report = detect_drift(conn)
+
+    if as_json:
+        import json as _json
+        click.echo(_json.dumps({
+            "untracked_cloud": report.untracked_cloud,
+            "stale_iac": report.stale_iac,
+            "untracked_prod_count": report.untracked_prod_count,
+        }, indent=2))
+        return
+
+    click.echo(render_drift(report, max_rows=max_rows))
+
+    # Exit code semantics: 0 = no drift, 1 = drift exists.
+    # Lets people wire `engram drift || alert-prod-team` into cron.
+    if report.untracked_cloud or report.stale_iac:
+        sys.exit(1)
+
+
+@cli.command(name="hook")
+def hook_cmd() -> None:
+    """Read a Claude Code PreToolUse payload from stdin and exit 0/1/2.
+
+    This is the enforcement primitive — the harness-layer gate that
+    turns Engram from advice into blocking safety. Not normally invoked
+    directly; instead, install it into Claude Code with:
+
+        engram hook-install --target claude-code
+
+    Exit codes:
+      0  = green / proceed (or non-Bash tool call → allow)
+      1  = orange / confirm (Claude Code shows user the warning)
+      2  = red / block (Claude Code refuses the tool call)
+
+    Override: ENGRAM_HOOK_ALLOW=red forces red operations through (audited).
+    Strict mode: ENGRAM_HOOK_STRICT=1 makes parser/DB failures block.
+    """
+    from engram.hook.main import run
+    sys.exit(run())
+
+
+@cli.command(name="hook-install")
+@click.option("--target", default="claude-code",
+              type=click.Choice(["claude-code"]),
+              show_default=True,
+              help="Agent harness to install the hook into.")
+@click.option("--dry-run", is_flag=True, default=False,
+              help="Show what would change without writing.")
+def hook_install_cmd(target: str, dry_run: bool) -> None:
+    """Install the Engram PreToolUse hook into an agent harness.
+
+    Mirrors `engram mcp install`: idempotent JSON merge. Only touches the
+    `hooks.PreToolUse` matcher entry for engram; other entries are left
+    alone.
+
+    After install, every `Bash` tool call in Claude Code is intercepted by
+    `engram hook` and gated by blast_radius.
+    """
+    from engram.hook.installer import install_hook
+    result = install_hook(target, dry_run=dry_run)
+    if "error" in result:
+        console.print(f"[red]{result['error']}[/red]")
+        sys.exit(1)
+    verb = "would " if dry_run else ""
+    console.print(
+        f"[green]{result['action']}[/green] ({verb}wrote): "
+        f"{result['config_path']}"
+    )
+    console.print(f"  matcher: {result.get('matcher_summary', '?')}")
+    if dry_run:
+        console.print("\n[dim]Re-run without --dry-run to actually write.[/dim]")
+    else:
+        console.print(
+            "\n[bold]Done.[/bold] Restart Claude Code so it picks up the hook.\n"
+            "Test with: [bold]engram hook < /dev/null[/bold]  (should exit 0).\n"
+            "Demo blocking: pipe a destructive tool-call JSON into [bold]engram hook[/bold]."
+        )
+
+
+@cli.command()
 def diagnose() -> None:
     """Quick diagnostic: where's the DB, what does it know, what's missing."""
     cfg = load_config()
@@ -521,15 +624,22 @@ def diagnose() -> None:
 
 
 @cli.command(name="import-cloud")
-@click.option("--provider", type=click.Choice(["aws"]), default="aws",
-              show_default=True, help="Cloud provider to discover.")
+@click.option("--provider", type=click.Choice(["aws", "gcp", "azure"]),
+              default="aws", show_default=True,
+              help="Cloud provider to discover (aws, gcp, or azure).")
 @click.option("--kinds", "-k",
               default="rds,ec2,s3,eks,lambda,elb,ecs,sqs,sns,dynamodb,"
-                      "vpc,subnet,sg,iam,secrets,route53",
+                      "vpc,subnet,sg,iam,secrets,route53,"
+                      "cloudfront,apigateway,asg,ebs,elasticache,"
+                      "logs,alarms,events,stepfunctions,kms,acm,cognito,"
+                      "kinesis,opensearch,redshift,waf",
               show_default=True,
-              help=("Comma-separated kinds. v0.2: rds, ec2, s3, eks, lambda, "
-                    "elb, ecs, sqs, sns, dynamodb. v0.3 adds: vpc, subnet, "
-                    "sg, iam, secrets, route53."))
+              help=("Comma-separated kinds. v0.2 (10): rds, ec2, s3, eks, "
+                    "lambda, elb, ecs, sqs, sns, dynamodb. v0.3 (+6): vpc, "
+                    "subnet, sg, iam, secrets, route53. v0.4 (+16): "
+                    "cloudfront, apigateway, asg, ebs, elasticache, logs, "
+                    "alarms, events, stepfunctions, kms, acm, cognito, "
+                    "kinesis, opensearch, redshift, waf. 32 services total."))
 @click.option("--region", default=None,
               help="AWS region (default: read from AWS CLI config).")
 @click.option("--profile", default=None,
@@ -547,23 +657,31 @@ def import_cloud(provider: str, kinds: str, region: str | None,
 
         engram import-cloud --provider aws --kinds rds,s3,eks
     """
-    if provider != "aws":
-        console.print(f"[red]Provider '{provider}' not yet supported.[/red]")
-        sys.exit(1)
-    from engram.cloud.aws_import import import_aws
-
     cfg = load_config()
     conn = open_db(cfg)
     kind_list = [k.strip() for k in kinds.split(",") if k.strip()]
 
-    console.print(f"\n[bold]Importing AWS resources[/bold] ({', '.join(kind_list)})")
+    console.print(f"\n[bold]Importing {provider.upper()} resources[/bold] ({', '.join(kind_list)})")
     if region:
         console.print(f"  Region:  {region}")
     if profile:
         console.print(f"  Profile: {profile}")
 
-    with console.status("[bold green]Running AWS CLI..."):
-        stats = import_aws(conn, kinds=kind_list, region=region, profile=profile)
+    if provider == "aws":
+        from engram.cloud.aws_import import import_aws
+        with console.status("[bold green]Running AWS CLI..."):
+            stats = import_aws(conn, kinds=kind_list, region=region, profile=profile)
+    elif provider == "gcp":
+        from engram.cloud.gcp_import import import_gcp
+        with console.status("[bold green]Running gcloud..."):
+            stats = import_gcp(conn, kinds=kind_list, project=profile, region=region)
+    elif provider == "azure":
+        from engram.cloud.azure_import import import_azure
+        with console.status("[bold green]Running az..."):
+            stats = import_azure(conn, kinds=kind_list, subscription=profile)
+    else:
+        console.print(f"[red]Provider '{provider}' not supported.[/red]")
+        sys.exit(1)
 
     if stats.errors:
         for kind, reason in stats.errors:

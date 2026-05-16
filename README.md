@@ -47,6 +47,93 @@ Wire this into Claude Code or Cursor as an MCP server with one command. Now ever
 
 ---
 
+## Enforcement, not advice — `engram hook`
+
+The MCP server tells the agent about blast radius. The PreToolUse **hook**
+makes Claude Code refuse to run destructive commands at all when the
+tier is `red`. One-line install:
+
+```bash
+engram hook-install --target claude-code
+```
+
+After this, every `Bash` tool call in Claude Code is intercepted:
+
+```
+$ claude
+> please remove the old payments database
+
+[Claude attempts: terraform destroy -target=aws_db_instance.payments-prod]
+
+❌  BLOCK  Engram blast-radius: tier=red
+  operation:   terraform destroy
+  target:      payments-prod
+  environment: production
+  resources:   1
+  dependents:  3
+  reasons:
+    - Operation 'terraform destroy' is destructive (deletes/destroys state).
+    - Target is in PRODUCTION.
+    - 3 dependent resource(s) found.
+
+  To override this block, set ENGRAM_HOOK_ALLOW=red and re-run.
+  This override is logged in the memory table for audit.
+```
+
+The agent literally cannot proceed. Override is explicit and audited.
+This is the safety property the rest of the project assumes.
+
+---
+
+## `engram drift` — show the click-ops gap in one command
+
+```
+$ engram drift
+
+RESOURCES IN CLOUD BUT NOT IN IaC (untracked)
+  ❗ aws:rds:DBInstance     legacy-prod-2018      production   tier=red
+  ❗ aws:ec2:Instance        ssh-jumpbox           production   tier=red
+     aws:s3:Bucket           marketing-uploads     —            tier=green
+     ... and 38 more
+
+RESOURCES IN IaC BUT NOT IN CLOUD (stale or pending apply)
+     tf:aws_db_instance     payments_v2_db        infra/main.tf
+
+SUMMARY
+   47 cloud resources have no matching IaC reference.
+   12    of those are tagged or named as production.
+    3 IaC-declared resources have no matching cloud resource.
+```
+
+The single most-demoable command in the project. Joins source IaC and
+discovered cloud state, highlights production drift first, exits 1 if
+drift exists so you can wire it into cron / CI.
+
+---
+
+## Multi-cloud: AWS + GCP + Azure
+
+Engram covers 56 cloud resource types across the three major providers
+via the same shell-out-to-CLI pattern. Engram never authenticates to your
+cloud; your existing `aws` / `gcloud` / `az` CLIs do.
+
+```bash
+engram import-cloud --provider aws       # 32 AWS services
+engram import-cloud --provider gcp       # 12 GCP services
+engram import-cloud --provider azure     # 12 Azure services
+engram import-cluster                    # any K8s cluster, 21 kinds
+```
+
+| Provider | Service coverage |
+|---|---|
+| **AWS** (32) | RDS, EC2, S3, EKS, Lambda, ELB, ECS, SQS, SNS, DynamoDB, VPC, Subnet, SecurityGroup, IAM, SecretsManager+SSM, Route53, CloudFront, API Gateway, ASG+LaunchTemplate, EBS, ElastiCache, CloudWatch Logs+Alarms, EventBridge, Step Functions, KMS, ACM, Cognito, Kinesis, OpenSearch, Redshift, WAFv2 |
+| **GCP** (12) | Compute (instances+disks), Cloud Storage, Cloud SQL, GKE+NodePools, Cloud Functions, Cloud Run, Pub/Sub, BigQuery, IAM SA, VPC+Subnets+Firewall, Cloud DNS, Secret Manager+Memorystore |
+| **Azure** (12) | Resource Groups, VMs+Disks, Storage Accounts, SQL, Cosmos DB, AKS, Functions, Service Bus, Event Hubs, App Service+Container Apps, VNets+NSGs+PrivateDNS, Key Vault |
+
+After import, the post-pass wires cross-resource USES edges (RDS → SG,
+EC2 → Subnet, etc.) so `engram dependents_of sg-prod-rds` instantly
+returns every workload that uses the security group.
+
 ## Works for clicked-into-existence infrastructure too
 
 Most production resources weren't created from Terraform — they were clicked

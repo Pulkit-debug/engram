@@ -75,9 +75,39 @@ def _classify_env(doc: dict, path: str) -> str:
     return ""
 
 
+def _is_cloudformation(doc: Any) -> bool:
+    """A CloudFormation template has either AWSTemplateFormatVersion or a
+    top-level `Resources` dict mapping logical IDs to objects with `Type`.
+    """
+    if not isinstance(doc, dict):
+        return False
+    if "AWSTemplateFormatVersion" in doc:
+        return True
+    res = doc.get("Resources")
+    if not isinstance(res, dict) or not res:
+        return False
+    # Sample one entry — should be a dict with a Type field.
+    sample = next(iter(res.values()), None)
+    return isinstance(sample, dict) and "Type" in sample
+
+
 class YAMLExtractor(BaseExtractor):
     def extract(self, path: Path, content: str) -> ExtractionResult:
         result = ExtractionResult(file_path=str(path))
+
+        # CloudFormation templates need different parsing (short-form
+        # intrinsics like !Ref break PyYAML's safe loader). Route to the
+        # CFN extractor by content-sniffing the file's first ~4 KB.
+        sniff = content[:4096]
+        if ("AWSTemplateFormatVersion" in sniff
+                or ("Resources:" in sniff and "Type:" in sniff)):
+            try:
+                from engram.extractors.cloudformation_ext import CloudFormationExtractor
+                return CloudFormationExtractor().extract(path, content)
+            except Exception:
+                # If CFN parsing blows up, fall through to generic YAML.
+                pass
+
         try:
             docs = list(yaml.safe_load_all(content))
         except yaml.YAMLError:
@@ -88,6 +118,14 @@ class YAMLExtractor(BaseExtractor):
                 continue
             if _is_k8s(doc):
                 self._extract_k8s(doc, path, result)
+            elif _is_cloudformation(doc):
+                # Backstop in case the sniff didn't catch it.
+                try:
+                    from engram.extractors.cloudformation_ext import CloudFormationExtractor
+                    return CloudFormationExtractor().extract(path, content)
+                except Exception:
+                    if doc:
+                        self._extract_generic(doc, path, result)
             elif isinstance(doc, dict):
                 # Generic YAML doc — emit a shallow resource so it shows up.
                 # Skip if obviously not config (e.g., empty).

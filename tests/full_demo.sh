@@ -193,7 +193,56 @@ echo "$INFER_OUT" | grep -q "BLOCK" || fail "expected BLOCK for prod-tagged RDS"
 echo "$INFER_OUT" | grep -qE "Dependents:[[:space:]]*[1-9]" || fail "expected >= 1 inferred dependent"
 ok "value-match inferred a DEPENDS_ON edge; blast_radius surfaced it"
 
-hr "  RESULT: all 11 checks passed"
+# -------------------------------------------------------------------------
+hr "12/13 PreToolUse hook (the enforcement primitive)"
+# -------------------------------------------------------------------------
+# Pipe a Claude-Code-shaped Bash payload into `engram hook`. With the
+# datatalks_prod_db seeded earlier, the destructive op must exit 2 (BLOCK).
+HOOK_PAYLOAD='{"tool_name":"Bash","tool_input":{"command":"terraform destroy -target=aws_db_instance.datatalks_prod_db"}}'
+HOOK_STDERR=$(echo "$HOOK_PAYLOAD" | "$ENGRAM" hook 2>&1 1>/dev/null; printf '%s' "exit=$?")
+echo "$HOOK_STDERR" | tail -10
+case "$HOOK_STDERR" in
+    *exit=2*) ok "hook exited 2 (BLOCK) on destructive op against prod resource" ;;
+    *) fail "expected exit 2; got: ${HOOK_STDERR##*exit=}" ;;
+esac
+
+# A read-only command must exit 0.
+GREEN_PAYLOAD='{"tool_name":"Bash","tool_input":{"command":"kubectl get pods"}}'
+GREEN_RC=$(echo "$GREEN_PAYLOAD" | "$ENGRAM" hook >/dev/null 2>&1; echo $?)
+[[ "$GREEN_RC" == "0" ]] || fail "expected hook exit 0 on read-op; got $GREEN_RC"
+
+# -------------------------------------------------------------------------
+hr "13/13 engram drift (cloud-vs-IaC reconciliation)"
+# -------------------------------------------------------------------------
+# Seed a click-ops cloud-discovered resource that has no IaC counterpart,
+# then run drift and verify it surfaces.
+"$PY" - <<'PYEOF'
+from engram.config import load_config
+from engram.db import open_db
+from engram.graph import (FileRow, ProjectRow, ResourceRow,
+    resource_uid, upsert_file, upsert_project, upsert_resource)
+cfg = load_config()
+conn = open_db(cfg)
+upsert_project(conn, ProjectRow(path="", name="cloud"))
+fp = "aws://demo/us-east-1/rds-clickops"
+upsert_file(conn, FileRow(path=fp, project_path="", name="aws:rds",
+    extension="", size_bytes=0, content_hash="cops",
+    modified_at="2026-05-17T00:00:00Z", risk_tier="red"))
+upsert_resource(conn, ResourceRow(
+    uid=resource_uid("aws:rds:DBInstance", "legacy-prod-2018", "us-east-1", fp),
+    file_path=fp, kind="aws:rds:DBInstance", name="legacy-prod-2018",
+    namespace="us-east-1", environment="production", risk_tier="red",
+    properties={"discovered_from": "aws-cli", "account": "demo", "region": "us-east-1"}))
+PYEOF
+
+# `engram drift` exits 1 when drift is found (so it can be cron'd).
+DRIFT_OUT=$("$ENGRAM" drift 2>&1) || true
+echo "$DRIFT_OUT" | head -20
+echo "$DRIFT_OUT" | grep -q "legacy-prod-2018" || fail "expected legacy-prod-2018 in drift output"
+echo "$DRIFT_OUT" | grep -q "❗" || fail "expected production-marker in drift output"
+ok "drift report surfaced the click-ops production resource"
+
+hr "  RESULT: all 13 checks passed"
 echo
 echo "  Database:    $DB/engram.db"
 echo "  Fixture:     $FIXTURE"

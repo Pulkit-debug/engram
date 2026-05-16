@@ -118,6 +118,23 @@ def import_aws(
         "iam":      _import_iam,
         "secrets":  _import_secrets,
         "route53":  _import_route53,
+        # v0.4: customer-facing + state + security
+        "cloudfront":  _import_cloudfront,
+        "apigateway":  _import_apigateway,
+        "asg":         _import_asg,
+        "ebs":         _import_ebs,
+        "elasticache": _import_elasticache,
+        "logs":        _import_cloudwatch_logs,
+        "alarms":      _import_cloudwatch_alarms,
+        "events":      _import_eventbridge,
+        "stepfunctions": _import_stepfunctions,
+        "kms":         _import_kms,
+        "acm":         _import_acm,
+        "cognito":     _import_cognito,
+        "kinesis":     _import_kinesis,
+        "opensearch":  _import_opensearch,
+        "redshift":    _import_redshift,
+        "waf":         _import_waf,
     }
 
     for kind in kinds:
@@ -132,6 +149,16 @@ def import_aws(
             stats.errors.append((kind, str(exc)))
 
     upsert_technology(conn, "aws", "cloud")
+
+    # Post-pass: wire USES edges from captured _attachments to the
+    # corresponding SG / Subnet / VPC / IAM Resources, if any of them
+    # were also discovered in this run (or were already in the graph).
+    try:
+        from engram.inference.cloud_attachments import link_cloud_attachments
+        link_cloud_attachments(conn)
+    except Exception as exc:
+        logger.warning("cloud-attachment linking failed: %s", exc)
+
     return stats
 
 
@@ -149,6 +176,12 @@ def _import_rds(conn, stats, *, account, region, profile, aws_cli) -> int:
             continue
         tags = _tags_to_dict(db.get("TagList") or [])
         env = _env_from_tags(tags) or _env_from_name(name)
+        # Capture attachment IDs so _link_attachments() can wire USES edges.
+        sg_ids = [g.get("VpcSecurityGroupId", "") for g in (db.get("VpcSecurityGroups") or [])]
+        subnet_ids = [
+            s.get("SubnetIdentifier", "")
+            for s in ((db.get("DBSubnetGroup") or {}).get("Subnets") or [])
+        ]
         props = {
             "arn": db.get("DBInstanceArn", ""),
             "engine": db.get("Engine", ""),
@@ -157,6 +190,11 @@ def _import_rds(conn, stats, *, account, region, profile, aws_cli) -> int:
             "status": db.get("DBInstanceStatus", ""),
             "multi_az": db.get("MultiAZ", False),
             "endpoint": (db.get("Endpoint") or {}).get("Address", ""),
+            "_attachments": {
+                "security_group_ids": [s for s in sg_ids if s],
+                "subnet_ids": [s for s in subnet_ids if s],
+                "db_subnet_group": (db.get("DBSubnetGroup") or {}).get("DBSubnetGroupName", ""),
+            },
         }
         _insert_resource(conn, "rds", name, env, props, account, region, "aws:rds:DBInstance")
         count += 1
@@ -177,13 +215,22 @@ def _import_ec2(conn, stats, *, account, region, profile, aws_cli) -> int:
             if not name:
                 continue
             env = _env_from_tags(tags) or _env_from_name(name)
+            sg_ids = [g.get("GroupId", "") for g in (inst.get("SecurityGroups") or [])]
+            iam_profile = (inst.get("IamInstanceProfile") or {}).get("Arn", "")
             props = {
                 "instance_id": instance_id,
                 "instance_type": inst.get("InstanceType", ""),
                 "state": (inst.get("State") or {}).get("Name", ""),
                 "private_ip": inst.get("PrivateIpAddress", ""),
                 "vpc_id": inst.get("VpcId", ""),
+                "subnet_id": inst.get("SubnetId", ""),
                 "tags": tags,
+                "_attachments": {
+                    "security_group_ids": [s for s in sg_ids if s],
+                    "subnet_ids": [inst.get("SubnetId", "")] if inst.get("SubnetId") else [],
+                    "vpc_ids": [inst.get("VpcId", "")] if inst.get("VpcId") else [],
+                    "iam_instance_profile_arn": iam_profile,
+                },
             }
             _insert_resource(conn, "ec2", name, env, props, account, region, "aws:ec2:Instance")
             count += 1
@@ -564,6 +611,493 @@ def _import_route53(conn, stats, *, account, region, profile, aws_cli) -> int:
         except _AwsCliError:
             pass
 
+    stats.discovered += count
+    stats.inserted += count
+    return count
+
+
+# ---------------------------------------------------------------------------
+# v0.4 — Customer-facing surface + state + security
+# ---------------------------------------------------------------------------
+
+def _import_cloudfront(conn, stats, *, account, region, profile, aws_cli) -> int:
+    """CloudFront distributions. Customer-facing CDN. Global service."""
+    out = _aws_json(aws_cli, profile, None, ["cloudfront", "list-distributions"])
+    dlist = (out.get("DistributionList") or {}).get("Items") or []
+    count = 0
+    for d in dlist:
+        dist_id = d.get("Id", "")
+        name = d.get("DomainName", "") or dist_id
+        if not name:
+            continue
+        env = _env_from_name(name)
+        props = {
+            "id": dist_id,
+            "arn": d.get("ARN", ""),
+            "domain_name": d.get("DomainName", ""),
+            "status": d.get("Status", ""),
+            "enabled": d.get("Enabled", False),
+            "price_class": d.get("PriceClass", ""),
+        }
+        _insert_resource(conn, "cloudfront", name, env, props,
+                         account, "global", "aws:cloudfront:Distribution")
+        count += 1
+    stats.discovered += count
+    stats.inserted += count
+    return count
+
+
+def _import_apigateway(conn, stats, *, account, region, profile, aws_cli) -> int:
+    """API Gateway REST APIs + HTTP APIs (v2)."""
+    count = 0
+    # REST APIs.
+    try:
+        rest_out = _aws_json(aws_cli, profile, region, ["apigateway", "get-rest-apis"])
+        for api in rest_out.get("items", []):
+            name = api.get("name", "") or api.get("id", "")
+            if not name:
+                continue
+            env = _env_from_name(name)
+            props = {
+                "id": api.get("id", ""),
+                "endpoint_configuration": api.get("endpointConfiguration", {}),
+                "created_date": api.get("createdDate", ""),
+            }
+            _insert_resource(conn, "apigateway", name, env, props,
+                             account, region, "aws:apigateway:RestApi")
+            count += 1
+    except _AwsCliError:
+        pass
+
+    # HTTP / WebSocket APIs.
+    try:
+        v2_out = _aws_json(aws_cli, profile, region, ["apigatewayv2", "get-apis"])
+        for api in v2_out.get("Items", []):
+            name = api.get("Name", "") or api.get("ApiId", "")
+            if not name:
+                continue
+            env = _env_from_name(name)
+            props = {
+                "id": api.get("ApiId", ""),
+                "protocol_type": api.get("ProtocolType", ""),
+                "api_endpoint": api.get("ApiEndpoint", ""),
+            }
+            _insert_resource(conn, "apigateway", name, env, props,
+                             account, region, "aws:apigatewayv2:Api")
+            count += 1
+    except _AwsCliError:
+        pass
+
+    stats.discovered += count
+    stats.inserted += count
+    return count
+
+
+def _import_asg(conn, stats, *, account, region, profile, aws_cli) -> int:
+    """Auto Scaling Groups + Launch Templates."""
+    count = 0
+    # ASGs.
+    try:
+        out = _aws_json(aws_cli, profile, region,
+                        ["autoscaling", "describe-auto-scaling-groups"])
+        for asg in out.get("AutoScalingGroups", []):
+            name = asg.get("AutoScalingGroupName", "")
+            if not name:
+                continue
+            tags = _tags_to_dict(asg.get("Tags") or [])
+            env = _env_from_tags(tags) or _env_from_name(name)
+            props = {
+                "arn": asg.get("AutoScalingGroupARN", ""),
+                "desired": asg.get("DesiredCapacity", 0),
+                "min": asg.get("MinSize", 0),
+                "max": asg.get("MaxSize", 0),
+                "launch_template": (asg.get("LaunchTemplate") or {}).get("LaunchTemplateName", ""),
+                "vpc_zone_identifier": asg.get("VPCZoneIdentifier", ""),
+                "tags": tags,
+            }
+            _insert_resource(conn, "asg", name, env, props,
+                             account, region, "aws:autoscaling:Group")
+            count += 1
+    except _AwsCliError:
+        pass
+
+    # Launch Templates.
+    try:
+        out = _aws_json(aws_cli, profile, region,
+                        ["ec2", "describe-launch-templates"])
+        for lt in out.get("LaunchTemplates", []):
+            name = lt.get("LaunchTemplateName", "") or lt.get("LaunchTemplateId", "")
+            if not name:
+                continue
+            tags = _tags_to_dict(lt.get("Tags") or [])
+            env = _env_from_tags(tags) or _env_from_name(name)
+            props = {
+                "id": lt.get("LaunchTemplateId", ""),
+                "default_version": lt.get("DefaultVersionNumber", 0),
+                "latest_version": lt.get("LatestVersionNumber", 0),
+                "tags": tags,
+            }
+            _insert_resource(conn, "asg", name, env, props,
+                             account, region, "aws:ec2:LaunchTemplate")
+            count += 1
+    except _AwsCliError:
+        pass
+
+    stats.discovered += count
+    stats.inserted += count
+    return count
+
+
+def _import_ebs(conn, stats, *, account, region, profile, aws_cli) -> int:
+    """EBS Volumes — holds state independently from EC2."""
+    out = _aws_json(aws_cli, profile, region, ["ec2", "describe-volumes"])
+    count = 0
+    for vol in out.get("Volumes", []):
+        vol_id = vol.get("VolumeId", "")
+        tags = _tags_to_dict(vol.get("Tags") or [])
+        name = tags.get("Name") or vol_id
+        if not name:
+            continue
+        env = _env_from_tags(tags) or _env_from_name(name)
+        attachments = vol.get("Attachments") or []
+        props = {
+            "volume_id": vol_id,
+            "size_gb": vol.get("Size", 0),
+            "volume_type": vol.get("VolumeType", ""),
+            "state": vol.get("State", ""),
+            "encrypted": vol.get("Encrypted", False),
+            "attached_instance": attachments[0].get("InstanceId", "") if attachments else "",
+            "availability_zone": vol.get("AvailabilityZone", ""),
+            "tags": tags,
+        }
+        _insert_resource(conn, "ebs", name, env, props,
+                         account, region, "aws:ec2:Volume")
+        count += 1
+    stats.discovered += count
+    stats.inserted += count
+    return count
+
+
+def _import_elasticache(conn, stats, *, account, region, profile, aws_cli) -> int:
+    """ElastiCache: Redis + Memcached."""
+    count = 0
+    # CacheClusters (Memcached + Redis non-cluster-mode).
+    try:
+        out = _aws_json(aws_cli, profile, region,
+                        ["elasticache", "describe-cache-clusters"])
+        for cluster in out.get("CacheClusters", []):
+            name = cluster.get("CacheClusterId", "")
+            if not name:
+                continue
+            env = _env_from_name(name)
+            props = {
+                "arn": cluster.get("ARN", ""),
+                "engine": cluster.get("Engine", ""),
+                "engine_version": cluster.get("EngineVersion", ""),
+                "node_type": cluster.get("CacheNodeType", ""),
+                "num_nodes": cluster.get("NumCacheNodes", 0),
+                "status": cluster.get("CacheClusterStatus", ""),
+                "endpoint": (cluster.get("ConfigurationEndpoint") or {}).get("Address", ""),
+            }
+            _insert_resource(conn, "elasticache", name, env, props,
+                             account, region, "aws:elasticache:CacheCluster")
+            count += 1
+    except _AwsCliError:
+        pass
+
+    # Replication Groups (Redis cluster mode).
+    try:
+        out = _aws_json(aws_cli, profile, region,
+                        ["elasticache", "describe-replication-groups"])
+        for rg in out.get("ReplicationGroups", []):
+            name = rg.get("ReplicationGroupId", "")
+            if not name:
+                continue
+            env = _env_from_name(name)
+            props = {
+                "arn": rg.get("ARN", ""),
+                "description": rg.get("Description", ""),
+                "status": rg.get("Status", ""),
+                "endpoint": (rg.get("ConfigurationEndpoint") or {}).get("Address", ""),
+                "cluster_enabled": rg.get("ClusterEnabled", False),
+            }
+            _insert_resource(conn, "elasticache", name, env, props,
+                             account, region, "aws:elasticache:ReplicationGroup")
+            count += 1
+    except _AwsCliError:
+        pass
+
+    stats.discovered += count
+    stats.inserted += count
+    return count
+
+
+def _import_cloudwatch_logs(conn, stats, *, account, region, profile, aws_cli) -> int:
+    """CloudWatch Log Groups."""
+    out = _aws_json(aws_cli, profile, region, ["logs", "describe-log-groups"])
+    count = 0
+    for lg in out.get("logGroups", []):
+        name = lg.get("logGroupName", "")
+        if not name:
+            continue
+        env = _env_from_name(name)
+        props = {
+            "arn": lg.get("arn", ""),
+            "retention_days": lg.get("retentionInDays", 0),
+            "stored_bytes": lg.get("storedBytes", 0),
+            "kms_key_id": lg.get("kmsKeyId", ""),
+        }
+        _insert_resource(conn, "logs", name, env, props,
+                         account, region, "aws:logs:LogGroup")
+        count += 1
+    stats.discovered += count
+    stats.inserted += count
+    return count
+
+
+def _import_cloudwatch_alarms(conn, stats, *, account, region, profile, aws_cli) -> int:
+    """CloudWatch metric alarms. Deleting these hides incidents."""
+    out = _aws_json(aws_cli, profile, region, ["cloudwatch", "describe-alarms"])
+    count = 0
+    for a in out.get("MetricAlarms", []):
+        name = a.get("AlarmName", "")
+        if not name:
+            continue
+        env = _env_from_name(name)
+        props = {
+            "arn": a.get("AlarmArn", ""),
+            "state": a.get("StateValue", ""),
+            "metric_name": a.get("MetricName", ""),
+            "namespace": a.get("Namespace", ""),
+            "threshold": a.get("Threshold", 0),
+            "comparison": a.get("ComparisonOperator", ""),
+            "actions_enabled": a.get("ActionsEnabled", False),
+        }
+        _insert_resource(conn, "alarms", name, env, props,
+                         account, region, "aws:cloudwatch:Alarm")
+        count += 1
+    stats.discovered += count
+    stats.inserted += count
+    return count
+
+
+def _import_eventbridge(conn, stats, *, account, region, profile, aws_cli) -> int:
+    """EventBridge rules. Async fan-out; deletion cascades."""
+    out = _aws_json(aws_cli, profile, region, ["events", "list-rules"])
+    count = 0
+    for rule in out.get("Rules", []):
+        name = rule.get("Name", "")
+        if not name:
+            continue
+        env = _env_from_name(name)
+        props = {
+            "arn": rule.get("Arn", ""),
+            "state": rule.get("State", ""),
+            "schedule_expression": rule.get("ScheduleExpression", ""),
+            "event_pattern": rule.get("EventPattern", ""),
+        }
+        _insert_resource(conn, "events", name, env, props,
+                         account, region, "aws:events:Rule")
+        count += 1
+    stats.discovered += count
+    stats.inserted += count
+    return count
+
+
+def _import_stepfunctions(conn, stats, *, account, region, profile, aws_cli) -> int:
+    """Step Functions state machines. Orchestration; high-impact deletion."""
+    out = _aws_json(aws_cli, profile, region, ["stepfunctions", "list-state-machines"])
+    count = 0
+    for sm in out.get("stateMachines", []):
+        name = sm.get("name", "")
+        if not name:
+            continue
+        env = _env_from_name(name)
+        props = {
+            "arn": sm.get("stateMachineArn", ""),
+            "type": sm.get("type", ""),
+            "creation_date": sm.get("creationDate", ""),
+        }
+        _insert_resource(conn, "stepfunctions", name, env, props,
+                         account, region, "aws:states:StateMachine")
+        count += 1
+    stats.discovered += count
+    stats.inserted += count
+    return count
+
+
+def _import_kms(conn, stats, *, account, region, profile, aws_cli) -> int:
+    """KMS keys. Deleting one renders data unreadable. CRITICAL."""
+    out = _aws_json(aws_cli, profile, region, ["kms", "list-keys"])
+    count = 0
+    for key in out.get("Keys", []):
+        key_id = key.get("KeyId", "")
+        if not key_id:
+            continue
+        # Most KMS keys don't have a friendly name; pull aliases best-effort.
+        name = key_id
+        env = ""
+        try:
+            aliases = _aws_json(aws_cli, profile, region,
+                                ["kms", "list-aliases", "--key-id", key_id])
+            alias_list = aliases.get("Aliases") or []
+            if alias_list:
+                alias_name = alias_list[0].get("AliasName", "") or ""
+                if alias_name.startswith("alias/"):
+                    alias_name = alias_name[6:]
+                if alias_name:
+                    name = alias_name
+                    env = _env_from_name(name)
+        except _AwsCliError:
+            pass
+
+        props = {
+            "key_id": key_id,
+            "arn": key.get("KeyArn", ""),
+        }
+        _insert_resource(conn, "kms", name, env, props,
+                         account, region, "aws:kms:Key")
+        count += 1
+    stats.discovered += count
+    stats.inserted += count
+    return count
+
+
+def _import_acm(conn, stats, *, account, region, profile, aws_cli) -> int:
+    """ACM certificates. Deleting one breaks HTTPS for whatever uses it."""
+    out = _aws_json(aws_cli, profile, region, ["acm", "list-certificates"])
+    count = 0
+    for cert in out.get("CertificateSummaryList", []):
+        domain = cert.get("DomainName", "") or cert.get("CertificateArn", "")
+        if not domain:
+            continue
+        env = _env_from_name(domain)
+        props = {
+            "arn": cert.get("CertificateArn", ""),
+            "domain_name": cert.get("DomainName", ""),
+            "status": cert.get("Status", ""),
+            "type": cert.get("Type", ""),
+            "in_use_by": cert.get("InUse", False),
+        }
+        _insert_resource(conn, "acm", domain, env, props,
+                         account, region, "aws:acm:Certificate")
+        count += 1
+    stats.discovered += count
+    stats.inserted += count
+    return count
+
+
+def _import_cognito(conn, stats, *, account, region, profile, aws_cli) -> int:
+    """Cognito User Pools. Auth surface; deleting = users locked out."""
+    out = _aws_json(aws_cli, profile, region,
+                    ["cognito-idp", "list-user-pools", "--max-results", "60"])
+    count = 0
+    for pool in out.get("UserPools", []):
+        name = pool.get("Name", "") or pool.get("Id", "")
+        if not name:
+            continue
+        env = _env_from_name(name)
+        props = {
+            "id": pool.get("Id", ""),
+            "creation_date": pool.get("CreationDate", ""),
+            "last_modified_date": pool.get("LastModifiedDate", ""),
+        }
+        _insert_resource(conn, "cognito", name, env, props,
+                         account, region, "aws:cognito:UserPool")
+        count += 1
+    stats.discovered += count
+    stats.inserted += count
+    return count
+
+
+def _import_kinesis(conn, stats, *, account, region, profile, aws_cli) -> int:
+    """Kinesis Data Streams."""
+    out = _aws_json(aws_cli, profile, region, ["kinesis", "list-streams"])
+    count = 0
+    for stream_name in out.get("StreamNames", []):
+        env = _env_from_name(stream_name)
+        # Could describe-stream for shard count; keeping it cheap.
+        _insert_resource(conn, "kinesis", stream_name, env, {},
+                         account, region, "aws:kinesis:Stream")
+        count += 1
+    stats.discovered += count
+    stats.inserted += count
+    return count
+
+
+def _import_opensearch(conn, stats, *, account, region, profile, aws_cli) -> int:
+    """OpenSearch / Elasticsearch domains."""
+    out = _aws_json(aws_cli, profile, region,
+                    ["opensearch", "list-domain-names"])
+    count = 0
+    for d in out.get("DomainNames", []):
+        name = d.get("DomainName", "")
+        if not name:
+            continue
+        env = _env_from_name(name)
+        engine_type = d.get("EngineType", "")
+        props = {"engine_type": engine_type}
+        _insert_resource(conn, "opensearch", name, env, props,
+                         account, region, "aws:opensearch:Domain")
+        count += 1
+    stats.discovered += count
+    stats.inserted += count
+    return count
+
+
+def _import_redshift(conn, stats, *, account, region, profile, aws_cli) -> int:
+    """Redshift clusters. Data warehouse."""
+    out = _aws_json(aws_cli, profile, region,
+                    ["redshift", "describe-clusters"])
+    count = 0
+    for cluster in out.get("Clusters", []):
+        name = cluster.get("ClusterIdentifier", "")
+        if not name:
+            continue
+        tags = _tags_to_dict(cluster.get("Tags") or [])
+        env = _env_from_tags(tags) or _env_from_name(name)
+        props = {
+            "node_type": cluster.get("NodeType", ""),
+            "status": cluster.get("ClusterStatus", ""),
+            "num_nodes": cluster.get("NumberOfNodes", 0),
+            "endpoint": (cluster.get("Endpoint") or {}).get("Address", ""),
+            "encrypted": cluster.get("Encrypted", False),
+            "tags": tags,
+        }
+        _insert_resource(conn, "redshift", name, env, props,
+                         account, region, "aws:redshift:Cluster")
+        count += 1
+    stats.discovered += count
+    stats.inserted += count
+    return count
+
+
+def _import_waf(conn, stats, *, account, region, profile, aws_cli) -> int:
+    """WAFv2 WebACLs. Security policies; removing one opens a hole."""
+    count = 0
+    for scope in ("REGIONAL", "CLOUDFRONT"):
+        scope_region = None if scope == "CLOUDFRONT" else region
+        try:
+            out = _aws_json(
+                aws_cli, profile, scope_region,
+                ["wafv2", "list-web-acls", "--scope", scope],
+            )
+        except _AwsCliError:
+            continue
+        for acl in out.get("WebACLs", []):
+            name = acl.get("Name", "")
+            if not name:
+                continue
+            env = _env_from_name(name)
+            props = {
+                "arn": acl.get("ARN", ""),
+                "id": acl.get("Id", ""),
+                "scope": scope,
+            }
+            _insert_resource(conn, "waf", name, env, props,
+                             account, scope_region or "global",
+                             "aws:wafv2:WebACL")
+            count += 1
     stats.discovered += count
     stats.inserted += count
     return count

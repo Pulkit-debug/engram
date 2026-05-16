@@ -1,5 +1,107 @@
 # Engram — Build status
 
+## v0.4 — Enforcement, drift, multi-cloud (SHIPPED ✓)
+
+The single biggest gap in v0.3 was the gap between *advice* and
+*enforcement*. v0.4 closes that gap, adds the headline drift-detection
+command, more than doubles cloud coverage, and brings multi-cloud parity.
+
+### The enforcement primitive — `engram hook`
+
+The PreToolUse hook for Claude Code. Reads JSON from stdin, classifies
+the Bash command (`terraform destroy`, `kubectl delete`, `helm uninstall`,
+`aws ... delete`, `rm -rf`, etc.), calls `blast_radius.assess()`, and
+exits with the harness-honored code:
+
+- `0` (proceed) — green tier or non-infra command
+- `1` (confirm) — orange tier, user is shown the warning
+- `2` (block) — red tier, Claude Code refuses to run the command
+
+Plus `engram hook-install --target claude-code` for one-line wiring into
+`~/.claude/settings.json`, idempotent JSON merge that doesn't disturb
+other PreToolUse entries.
+
+Override path: `ENGRAM_HOOK_ALLOW=red` lets the user force a blocked op
+through; the override is logged to the `memory` table for audit.
+
+### The headline command — `engram drift`
+
+```
+RESOURCES IN CLOUD BUT NOT IN IaC (untracked)
+  ❗ aws:rds:DBInstance     legacy-prod-2018      production   tier=red
+  ❗ aws:ec2:Instance        ssh-jumpbox           production   tier=red
+    aws:s3:Bucket           marketing-uploads     —            tier=green
+
+RESOURCES IN IaC BUT NOT IN CLOUD (stale or pending apply)
+    tf:aws_db_instance     payments_v2_db        infra/main.tf
+
+SUMMARY
+  47 cloud resources have no matching IaC reference.
+  12    of those are tagged or named as production.
+   3 IaC-declared resources have no matching cloud resource.
+```
+
+The CTO demo. Joins both directions with a single SQL pass; production
+drift is highlighted first.
+
+### Multi-cloud parity (AWS + GCP + Azure)
+
+- **AWS:** 32 services (+16 from v0.3) — added CloudFront, API Gateway,
+  ASG + LaunchTemplate, EBS, ElastiCache, CloudWatch Logs+Alarms,
+  EventBridge, Step Functions, KMS, ACM, Cognito, Kinesis, OpenSearch,
+  Redshift, WAFv2.
+- **GCP:** 12 services — Compute, Storage, Cloud SQL, GKE, Cloud
+  Functions, Cloud Run, Pub/Sub, BigQuery, IAM, Networks, DNS, Secret
+  Manager + Memorystore.
+- **Azure:** 12 services — Resource Groups, VMs+Disks, Storage Accounts,
+  SQL, Cosmos DB, AKS, Functions, Service Bus, Event Hubs, App Service,
+  Networks, Key Vault.
+
+All three providers share the same shell-out-to-CLI pattern. Engram
+never authenticates to any cloud; your existing `aws` / `gcloud` /
+`az` CLIs do.
+
+### Cross-resource edges (depth, not breadth)
+
+Resources captured during cloud import now record `_attachments`
+(security_group_ids, subnet_ids, iam_profile_arn). A post-pass
+(`engram/inference/cloud_attachments.py`) walks every Resource and emits
+`USES` edges to the SG / Subnet / IAM Resources, *if* they've been
+imported. This is what makes
+`engram dependents_of sg-prod-rds` return every RDS that uses that
+security group — instantly answering "what breaks if I delete this SG?"
+
+### CloudFormation extractor
+
+Teams that use CloudFormation instead of Terraform are now covered. The
+extractor handles both YAML (with short-form intrinsics like `!Ref`)
+and JSON CFN templates. Resources are normalized to the same `tf:*`
+kinds so cross-format detection joins them with Terraform-defined
+resources of the same logical name.
+
+### v0.4 test counts
+
+```
+total:                                       238 / 238 passing
+                                             (+114 since v0.3)
+
+new in v0.4:
+  tests/test_hook.py                         54 / 54
+  tests/test_drift.py                        10 / 10
+  tests/test_cloud_attachments.py             6 / 6
+  tests/test_aws_import_v04.py               17 / 17
+  tests/test_multicloud_import.py            14 / 14
+  tests/test_cloudformation_ext.py           13 / 13
+```
+
+### v0.4 codebase
+
+- **15,487 LOC** (~5,300 added since v0.3)
+- 41 Python source files in `engram/`
+- 20 test files
+
+---
+
 ## v0.3 — Click-ops, benchmarks, sales material (SHIPPED ✓)
 
 The strategic phase. Three things the v0.2 release deferred:
