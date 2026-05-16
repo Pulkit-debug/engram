@@ -1,0 +1,128 @@
+{
+  "client": "engram mcp wire smoke",
+  "transport": "stdio",
+  "server_command": "python -m engram.mcp_server",
+  "list_tools": [
+    "blast_radius",
+    "dependents_of",
+    "forget",
+    "infra_context",
+    "infra_diff",
+    "recall",
+    "remember",
+    "service_map",
+    "trace_env_var",
+    "verify_context"
+  ],
+  "blast_radius_call": {
+    "args": {
+      "operation": "terraform destroy",
+      "target": "datatalks_prod_db"
+    },
+    "response": {
+      "operation": "terraform destroy",
+      "operation_class": "destructive",
+      "target": "datatalks_prod_db",
+      "environment": "production",
+      "risk_tier": "red",
+      "action": "block",
+      "dependents": [],
+      "resolved_resources": [
+        {
+          "uid": "c4b70006fa99dd48bd03",
+          "kind": "tf:aws_db_instance",
+          "name": "datatalks_prod_db",
+          "namespace": "",
+          "file_path": "/r/prod/main.tf"
+        }
+      ],
+      "incident_refs": [],
+      "reasons": [
+        "Operation 'terraform destroy' is destructive (deletes/destroys state).",
+        "Target is in PRODUCTION."
+      ]
+    }
+  },
+  "trace_env_var_call": {
+    "args": {
+      "name": "DATABASE_URL"
+    },
+    "response": {
+      "var_name": "DATABASE_URL",
+      "defined_in": [
+        {
+          "file": "/r/prod/main.tf",
+          "value": "postgres://...",
+          "project": "/r"
+        }
+      ],
+      "referenced_in": []
+    }
+  },
+  "infra_context_call": {
+    "args": {
+      "target": "datatalks_prod_db",
+      "token_budget": 1000
+    },
+    "response": {
+      "target": "datatalks_prod_db",
+      "found": true,
+      "summary": {
+        "target": "datatalks_prod_db",
+        "resource_count": 1,
+        "environments": [
+          "production"
+        ],
+        "risk_tier": "red",
+        "formats": [
+          "tf"
+        ],
+        "file_count": 1
+      },
+      "resources": [
+        {
+          "kind": "tf:aws_db_instance",
+          "name": "datatalks_prod_db",
+          "namespace": "",
+          "environment": "production",
+          "risk_tier": "red",
+          "file_path": "/r/prod/main.tf",
+          "properties": {}
+        }
+      ],
+      "env_vars": {
+        "defined": [
+          {
+            "name": "DATABASE_URL",
+            "value": "postgres://...",
+            "file": "/r/prod/main.tf"
+          }
+        ],
+        "referenced": [],
+        "external_definitions": []
+      },
+      "dependencies": [],
+      "recent_changes": [
+        {
+          "path": "/r/prod/main.tf",
+          "modified_at": "2026-05-14T00:00:00Z"
+        }
+      ]
+    }
+  },
+  "service_map_call": {
+    "args": {
+      "scope": "all"
+    },
+    "response_keys": [
+      "adjacency",
+      "edge_count",
+      "found",
+      "mermaid",
+      "node_count",
+      "nodes",
+      "scope"
+    ],
+    "node_count": 0
+  }
+}
